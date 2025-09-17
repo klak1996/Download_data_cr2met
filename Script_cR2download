@@ -1,0 +1,230 @@
+# %% Instalación de dependencias (ejecutar una sola vez en el kernel correcto)
+# Usa %pip para instalar dentro del entorno activo del kernel seleccionado
+%pip install --quiet requests beautifulsoup4 tqdm
+
+# %% Configuración general
+from pathlib import Path
+
+# Raíz del índice web
+ROOT = "https://ftp.cr2.cl/browse/cr2met/v2.5_R1/"
+
+# Variables a descargar (puedes quitar o agregar)
+VARIABLES = ["et0", "pr", "tmean", "txn"]
+
+# Subcarpeta donde están los archivos diarios
+DAY_SUBDIR = "v2.5_R1_day"
+
+# Extensiones a descargar (por defecto solo NetCDF)
+INCLUDE_EXT = {".nc"}
+
+# Concurrencia y cortesía
+MAX_WORKERS = 8
+POLITE_DELAY = 0.2
+TIMEOUT = 60
+
+# Carpeta local de destino (respetando estructura var/DAY_SUBDIR/archivo)
+OUTPUT_DIR = Path("C:/Python/klak1996/cr2met_download/data_v2.5_R1").resolve()
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+print("Descargará en:", OUTPUT_DIR)
+print("Variables:", VARIABLES)
+
+# %% Utilidades de red y parseo HTML
+import time
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse, urlunparse
+
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "cr2met-downloader/1.0 (+for research; contact: team)"
+})
+
+def clean_url(u: str) -> str:
+    p = urlparse(u)
+    return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
+
+def get_html(url: str, *, tries=5, timeout=60) -> str:
+    last = None
+    for k in range(tries):
+        try:
+            r = session.get(url, timeout=timeout)
+            r.raise_for_status()
+            return r.text
+        except requests.RequestException as e:
+            last = e
+            wait = 2 ** k
+            print(f"[get_html] {url} intento {k+1}/{tries} falló: {e}. Reintentando en {wait}s...")
+            time.sleep(wait)
+    raise RuntimeError(f"No se pudo obtener HTML de {url}: {last}")
+
+
+# %% Descubrir enlaces de archivos en v2.5_R1_day de una variable dada
+from typing import List
+
+def list_day_files_for_var(var: str) -> List[str]:
+    base = clean_url(urljoin(ROOT, f"{var}/"))
+    day_url = clean_url(urljoin(base + "/", f"{DAY_SUBDIR}/"))
+    html = get_html(day_url, timeout=TIMEOUT)
+    soup = BeautifulSoup(html, "html.parser")
+
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        # Construye URL absoluta del enlace
+        abs_url = clean_url(urljoin(day_url, href))
+        # Filtrar archivos (no directorios)
+        if href.endswith("/"):
+            continue
+        name = href.split("?")[0].split("#")[0]
+        # Filtrar por extensión
+        ext = ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else ""
+        if INCLUDE_EXT and ext not in INCLUDE_EXT:
+            continue
+        if "index.html" in name.lower():
+            continue
+        links.append(abs_url)
+
+    # Cortesía entre requests
+    time.sleep(POLITE_DELAY)
+    return links
+
+# Prueba: listar conteo por variable (sin descargar aún)
+all_files_preview = {}
+for v in VARIABLES:
+    try:
+        urls = list_day_files_for_var(v)
+        all_files_preview[v] = urls
+        print(f"{v}: {len(urls)} archivos detectados")
+        for u in urls[:3]:
+            print("  -", u)
+    except Exception as e:
+        print(f"[{v}] error listando: {e}")
+
+
+# %% Mapeo URL -> ruta local (var/DAY_SUBDIR/archivo)
+from urllib.parse import urlparse
+
+def url_to_local(file_url: str, var: str, out_dir: Path) -> Path:
+    name = Path(urlparse(file_url).path).name
+    local_path = out_dir / var / DAY_SUBDIR / name
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    return local_path
+
+# Prueba con el primer archivo de alguna variable
+for v, urls in all_files_preview.items():
+    if urls:
+        test_local = url_to_local(urls[0], v, OUTPUT_DIR)
+        print("Ejemplo mapeo:", urls[0], "->", test_local)
+        break
+
+
+# %% Descarga con reintentos, verificación por Content-Length y .part
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+
+def head_content_length(url: str):
+    try:
+        r = session.head(url, timeout=TIMEOUT, allow_redirects=True)
+        if r.ok:
+            cl = r.headers.get("Content-Length")
+            return int(cl) if cl is not None else None
+    except requests.RequestException:
+        pass
+    return None
+
+def download_one(url: str, var: str, out_dir: Path, max_retries: int = 5):
+    local_path = url_to_local(url, var, out_dir)
+    remote_size = head_content_length(url)
+
+    # Skip si ya existe con tamaño correcto
+    if local_path.exists() and remote_size is not None and local_path.stat().st_size == remote_size:
+        return (url, True, "skip_ok")
+
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            with session.get(url, stream=True, timeout=TIMEOUT) as r:
+                r.raise_for_status()
+                tmp_path = local_path.with_suffix(local_path.suffix + ".part")
+                with open(tmp_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                if remote_size is not None and tmp_path.stat().st_size != remote_size:
+                    tmp_path.unlink(missing_ok=True)
+                    raise IOError(f"size mismatch: expected {remote_size}, got {tmp_path.stat().st_size}")
+                tmp_path.rename(local_path)
+                return (url, True, "downloaded")
+        except Exception as e:
+            last_error = str(e)
+            wait = 2 ** attempt
+            time.sleep(wait)
+
+    return (url, False, f"error: {last_error}")
+
+def download_set(urls_by_var: dict[str, list[str]], out_dir: Path, max_workers: int = 8):
+    futures = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for var, urls in urls_by_var.items():
+            for u in urls:
+                futures.append(ex.submit(download_one, u, var, out_dir))
+        ok = skip = fail = 0
+        errors = []
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="Descargando"):
+            try:
+                _, success, msg = fut.result()
+                if success and msg == "skip_ok":
+                    skip += 1
+                elif success:
+                    ok += 1
+                else:
+                    fail += 1
+                    errors.append(msg)
+            except Exception as e:
+                fail += 1
+                errors.append(f"exception: {e}")
+    return {"ok": ok, "skip": skip, "fail": fail, "errors": errors}
+
+
+# %% Recolectar todos los archivos y descargar
+# Construye el listado final por variable
+urls_by_var = {}
+total = 0
+for v in VARIABLES:
+    urls = list_day_files_for_var(v)
+    urls_by_var[v] = urls
+    total += len(urls)
+    print(f"{v}: {len(urls)} archivos")
+
+print("Total a descargar:", total)
+if total == 0:
+    raise SystemExit("No se encontraron archivos .nc. Ejecuta la celda de diagnóstico.")
+
+# Ejecuta la descarga
+results = download_set(urls_by_var, OUTPUT_DIR, max_workers=MAX_WORKERS)
+
+print("\nResumen:")
+print(" - Descargados OK:", results["ok"])
+print(" - Saltados (existentes y correctos):", results["skip"])
+print(" - Fallidos:", results["fail"])
+if results["errors"]:
+    print("Ejemplos de errores:")
+    for e in results["errors"][:10]:
+        print(" *", e)
+
+
+# %% Diagnóstico (por si una carpeta no devuelve enlaces)
+# Guarda el HTML de cada v2.5_R1_day por variable para inspección manual
+for v in VARIABLES:
+    url = clean_url(urljoin(ROOT, f"{v}/{DAY_SUBDIR}/"))
+    try:
+        html = get_html(url, timeout=TIMEOUT)
+        out = OUTPUT_DIR / f"_debug_{v}_{DAY_SUBDIR}.html"
+        out.write_text(html, encoding="utf-8")
+        print(f"[{v}] HTML guardado en:", out)
+    except Exception as e:
+        print(f"[{v}] error obteniendo HTML:", e)
+
+
+# %%
